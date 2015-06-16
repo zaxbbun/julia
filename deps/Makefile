@@ -1,6 +1,5 @@
 ## high-level setup ##
 JULIAHOME = $(abspath ..)
-include Versions.make
 include $(JULIAHOME)/Make.inc
 
 # Special comments:
@@ -275,11 +274,6 @@ LLVM_GIT_URL_COMPILER_RT ?= $(LLVM_GIT_URL_BASE)/compiler-rt.git
 LLVM_GIT_URL_LLDB ?= $(LLVM_GIT_URL_BASE)/lldb.git
 LLVM_GIT_URL_LIBCXX ?= $(LLVM_GIT_URL_BASE)/libcxx.git
 LLVM_GIT_URL_LIBCXXABI ?= $(LLVM_GIT_URL_BASE)/libcxxabi.git
-
-ifeq ($(BUILD_LLDB), 1)
-BUILD_LLVM_CLANG = 1
-# because it's a build requirement
-endif
 
 ifeq ($(LLVM_DEBUG),1)
 LLVM_BUILDTYPE = Debug
@@ -852,7 +846,7 @@ install-openspecfun: $(OPENSPECFUN_OBJ_TARGET)
 DSFMT_OBJ_TARGET = $(build_shlibdir)/libdSFMT.$(SHLIB_EXT) $(build_includedir)/dSFMT.h
 DSFMT_OBJ_SOURCE = dsfmt-$(DSFMT_VER)/libdSFMT.$(SHLIB_EXT)
 
-DSFMT_CFLAGS = $(CFLAGS) -DNDEBUG -DDSFMT_MEXP=19937 $(fPIC) -DDSFMT_DO_NOT_USE_OLD_NAMES
+DSFMT_CFLAGS = $(CFLAGS) -DNDEBUG -DDSFMT_MEXP=19937 -fPIC -DDSFMT_DO_NOT_USE_OLD_NAMES
 ifneq ($(USEMSVC), 1)
 DSFMT_CFLAGS += -O3 -finline-functions -fomit-frame-pointer -fno-strict-aliasing \
 		--param max-inline-insns-single=1800 -Wmissing-prototypes -Wall  -std=c99 -shared
@@ -1130,7 +1124,7 @@ endif
 endif
 
 libgfortblas.$(SHLIB_EXT): gfortblas.c gfortblas.alias
-	$(CC) -Wall -O3 $(CPPFLAGS) $(CFLAGS) $(fPIC) -shared $< -o $@ -pipe \
+	$(CC) -Wall -O3 $(CPPFLAGS) $(CFLAGS) -fPIC -shared $< -o $@ -pipe \
 				-Wl,-reexport_framework,Accelerate -Wl,-alias_list,gfortblas.alias
 $(build_shlibdir)/libgfortblas.$(SHLIB_EXT): libgfortblas.$(SHLIB_EXT)
 	cp -f $< $@
@@ -1565,7 +1559,7 @@ $(build_shlibdir)/libsuitesparse_wrapper.$(SHLIB_EXT):  $(SUITESPARSE_OBJ_TARGET
 endif
 
 $(build_shlibdir)/libsuitesparse_wrapper.$(SHLIB_EXT): SuiteSparse_wrapper.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -O2 -shared $(fPIC) $(SUITESPARSE_INC) $< -o $@ $(SUITESPARSE_LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -O2 -shared -fPIC $(SUITESPARSE_INC) $< -o $@ $(SUITESPARSE_LIB)
 	$(INSTALL_NAME_CMD)libsuitesparse_wrapper.$(SHLIB_EXT) $@
 	touch -c $@
 
@@ -1898,7 +1892,7 @@ LIBGIT2_OPTS += -DWIN32=ON -DMINGW=ON -DUSE_SSH=OFF -DCMAKE_SYSTEM_NAME=Windows
 ifeq ($(BUILD_OS),WINNT)
 LIBGIT2_OPTS += -G"MSYS Makefiles"
 else
-LIBGIT2_OPTS += -DBUILD_CLAR=OFF -DCMAKE_RC_COMPILER=`which $(CROSS_COMPILE)windres`
+LIBGIT2_OPTS += -DBUILD_CLAR=OFF -DCMAKE_RC_COMPILER=`which windres`
 LIBGIT2_OPTS += -DCMAKE_FIND_ROOT_PATH=/usr/$(XC_HOST) -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
 endif
 endif
