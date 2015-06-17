@@ -78,17 +78,6 @@ AS := ml
 endif #ARCH
 LD := link
 endif #USEMSVC
-RANLIB := ranlib
-
-# file extensions
-ifeq ($(OS), WINNT)
-  SHLIB_EXT = dll
-else ifeq ($(OS), Darwin)
-  SHLIB_EXT = dylib
-else
-  SHLIB_EXT = so
-endif
-
 
 # if not absolute, then relative to the directory of the julia executable
 # on windows, use .ji by default
