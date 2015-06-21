@@ -51,17 +51,15 @@ set_target_properties(julia-inference-so PROPERTIES
 
 add_dependencies(julia-inference-so julia-inference)
 
-# TODO find perl
-set(PERL_COMMAND perl)
-
-string(REPLACE ";" " " PERL_COMMAND_STR "${PERL_COMMAND}")
-string(REPLACE ";" " " CPP_COMMAND_STR "${CPP_COMMAND}")
-configure_file(errno_h.jl.sh.in errno_h.jl.sh @ONLY)
+set(errno_h_jl "${CMAKE_CURRENT_BINARY_DIR}/errno_h.jl")
 
 add_custom_command(OUTPUT errno_h.jl
-  COMMAND sh errno_h.jl.sh errno_h.jl
-  WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-  DEPENDS errno_h.jl.sh.in)
+  COMMAND "${CMAKE_COMMAND}" "-DOUTPUT_FILE=${errno_h_jl}"
+  "-DCPP_COMMAND=${CPP_COMMAND}" "-DCUR_BIN_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+  "-DCUR_SRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+  -P errno_h.jl.cmake
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  DEPENDS errno_h.jl.cmake VERBATIM)
 
 add_custom_target(julia-errno_h.jl
   DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/errno_h.jl")
