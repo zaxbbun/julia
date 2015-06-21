@@ -1,35 +1,9 @@
 #
 
-include(CMakeVarMacros)
-
 get_filename_component(jl_cmake_utils_dir
   "${CMAKE_CURRENT_LIST_FILE}" PATH)
 
 set(jl_cmake_utils_dir "${jl_cmake_utils_dir}" CACHE "" INTERNAL FORCE)
-
-function(jl_std_fpath var path)
-  if(NOT IS_ABSOLUTE "${path}")
-    set(${var} "${path}" PARENT_SCOPE)
-    return()
-  endif()
-  file(RELATIVE_PATH src_path "${CMAKE_CURRENT_SOURCE_DIR}" "${path}")
-  file(RELATIVE_PATH bin_path "${CMAKE_CURRENT_BINARY_DIR}" "${path}")
-  string(LENGTH "${src_path}" src_len)
-  string(LENGTH "${bin_path}" bin_len)
-  if(src_len GREATER bin_len)
-    set(${var} "${bin_path}" PARENT_SCOPE)
-  else()
-    set(${var} "${src_path}" PARENT_SCOPE)
-  endif()
-endfunction()
-
-function(jl_fpath_to_target var file)
-  jl_std_fpath(std_fname "${file}")
-  string(REGEX REPLACE "[^-_.a-zA-Z0-9]" "_" std_fname "${std_fname}")
-  string(REGEX REPLACE "_+" "_" std_fname "${std_fname}")
-  cmake_utils_get_unique_name("${std_fname}" target)
-  set("${var}" "${target}" PARENT_SCOPE)
-endfunction()
 
 function(jl_rewrite_dep_list var deps)
   set(new_deps)
@@ -73,16 +47,4 @@ function(jl_custom_target target outputs output_deps target_deps autodep_file)
     "-DCUR_SRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
     -P "${jl_cmake_utils_dir}/jl_custom_target.cmake"
     DEPENDS ${target_deps} VERBATIM)
-endfunction()
-
-function(jl_custom_output outputs output_deps target_deps autodep_file)
-  if(NOT outputs)
-    cmake_utils_get_unique_name(jl_custom_target target)
-  else()
-    list(GET outputs 0 output1)
-    jl_fpath_to_target(target "${output1}")
-  endif()
-  set(jl_custom_output_target "${target}" PARENT_SCOPE)
-  jl_custom_target("${target}" "${outputs}" "${output_deps}"
-    "${target_deps}" "${autodep_file}" ${ARGN})
 endfunction()
