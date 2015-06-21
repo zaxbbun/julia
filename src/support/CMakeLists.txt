@@ -16,10 +16,15 @@ set(libsupport_SRCS
 
 if(WIN32)
   set(libsupport_SRCS ${libsupport_SRCS} asprintf.c)
+  enable_language(ASM_MASM)
   if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    set(libsupport_SRCS ${libsupport_SRCS} _setjmp.win64.c _longjmp.win64.c)
+    set(libsupport_SRCS ${libsupport_SRCS} _setjmp.win64.S _longjmp.win64.S)
+    set_source_files_properties(_setjmp.win64.S _longjmp.win64.S PROPERTIES
+      LANGUAGE ASM_MASM)
   else()
-    set(libsupport_SRCS ${libsupport_SRCS} _setjmp.win32.c _longjmp.win32.c)
+    set(libsupport_SRCS ${libsupport_SRCS} _setjmp.win32.S _longjmp.win32.S)
+    set_source_files_properties(_setjmp.win32.S _longjmp.win32.S PROPERTIES
+      LANGUAGE ASM_MASM)
   endif()
 endif()
 
