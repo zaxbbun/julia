@@ -75,6 +75,7 @@ const version = VersionNumber(version_array...)
 function __init__()
     ### Check if the linked library is compatible with the Julia code
     if Libdl.dlsym(Libdl.dlopen("libcholmod"), :cholmod_version) == C_NULL
+        hasversion = false
         warn("""
 
             CHOLMOD version incompatibility
@@ -91,6 +92,7 @@ function __init__()
             versions of all dependencies.
         """)
     else
+        hasversion = true
         tmp = Array(Cint, 3)
         ccall((:cholmod_version, :libcholmod), Cint, (Ptr{Cint},), version_array)
         ccall((:jl_cholmod_version, :libsuitesparse_wrapper), Cint, (Ptr{Cint},), tmp)
@@ -137,6 +139,14 @@ function __init__()
     ### Initiate CHOLMOD
     global const cmn = fill(0xff, common_size)
     start(cmn)
+
+    if hasversion && version >= v"3.0.0"
+        cnfg = cglobal((:SuiteSparse_config, :libcholmod), Ptr{Void})
+        unsafe_store!(cnfg, cglobal(:jl_malloc, Ptr{Void}), 1)
+        unsafe_store!(cnfg, cglobal(:jl_calloc, Ptr{Void}), 2)
+        unsafe_store!(cnfg, cglobal(:jl_realloc, Ptr{Void}), 3)
+        unsafe_store!(cnfg, cglobal(:jl_free, Ptr{Void}), 4)
+    end
 end
 
 function set_print_level(cm::Array{UInt8}, lev::Integer)
