@@ -61,7 +61,7 @@ function launch(manager::SSHManager, params::Dict, launched::Array, launch_ntfy:
     for (i,(machine, cnt)) in  enumerate(manager.machines)
         let machine=machine, cnt=cnt
             launch_tasks[i] = @schedule try
-                    launch_on_machine(manager, machine, cnt, params, launched, launch_ntfy)
+                    launch_at_node(machine, cnt, params, launched, launch_ntfy)
                 catch e
                     print(STDERR, "exception launching on machine $(machine) : $(e)\n")
                 end
@@ -79,7 +79,7 @@ end
 show(io::IO, manager::SSHManager) = println(io, "SSHManager(machines=", manager.machines, ")")
 
 
-function launch_on_machine(manager::SSHManager, machine, cnt, params, launched, launch_ntfy::Condition)
+function launch_at_node(machine, cnt, params, launched, launch_ntfy::Condition)
     dir = params[:dir]
     exename = params[:exename]
     exeflags = params[:exeflags]
