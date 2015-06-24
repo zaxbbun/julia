@@ -4,10 +4,12 @@
 set(JULIA_CPU_TARGET native)
 
 jl_custom_target(julia-inference0
-  "inference0.o;inference0.ji"
-  coreimg.jl julia-ui "${build_private_libdir}/inference0.fnames"
+  inference0.o
+  coreimg.jl julia-ui
+  inference0.fnames
   COMMAND "${build_bindir}/julia" -C ${JULIA_CPU_TARGET}
-  --build "${CMAKE_CURRENT_BINARY_DIR}/inference0" -f coreimg.jl
+  --output-o "${CMAKE_CURRENT_BINARY_DIR}/inference0.o"
+  --load-log "${CMAKE_CURRENT_BINARY_DIR}/inference0.fnames" -f coreimg.jl
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 
 if(NOT EXISTS "${CMAKE_CURRENT_BINARY_DIR}/dummy.c")
@@ -29,13 +31,14 @@ add_dependencies(julia-inference0-so julia-inference0)
 
 # TODO? use inference.so if it exists
 jl_custom_target(julia-inference
-  "${build_private_libdir}/inference.o;${build_private_libdir}/inference.ji"
+  "${build_private_libdir}/inference.o"
   "coreimg.jl;${CMAKE_CURRENT_BINARY_DIR}/inference0.o"
   "julia-ui;julia-inference0-so"
-  inference0.fnames
+  inference.fnames
   COMMAND "${build_bindir}/julia" -C ${JULIA_CPU_TARGET}
-  --build "${build_private_libdir}/inference" -f
-  -J "${CMAKE_CURRENT_BINARY_DIR}/inference0.ji" coreimg.jl
+  --output-o "${build_private_libdir}/inference.o" -f
+  --load-log "${CMAKE_CURRENT_BINARY_DIR}/inference.fnames"
+  -J "${CMAKE_CURRENT_BINARY_DIR}/inference0.so" coreimg.jl
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 
 add_library(julia-inference-so MODULE "${CMAKE_CURRENT_BINARY_DIR}/dummy.c")

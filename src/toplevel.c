@@ -603,16 +603,15 @@ jl_is_regfile(const char *fname)
 }
 
 static void
-jl_log_deps(const char *fpath)
+jl_log_deps(const char *_fpath)
 {
     static FILE *log_file = NULL;
     if (!log_file) {
-        char *log_path = NULL;
-        asprintf(&log_path, "%s.fnames", jl_options.build_path);
-        log_file = fopen(log_path, "w");
-        free(log_path);
+        log_file = fopen(jl_options.load_log, "w");
     }
+    char *fpath = abspath(_fpath);
     fprintf(log_file, "%s\n", fpath);
+    free(fpath);
     fflush(log_file);
 }
 
@@ -625,10 +624,8 @@ jl_value_t *jl_load(const char *fname)
 #endif
     }
     char *fpath = NULL;
-    int build_base_mode = (jl_build_base_path[0] &&
-                           jl_options.build_path != NULL);
     if (!jl_is_regfile(fname)) {
-        if (build_base_mode) {
+        if (jl_build_base_path[0]) {
             asprintf(&fpath, "%s/%s", jl_build_base_path, fname);
             if (!jl_is_regfile(fpath)) {
                 free(fpath);
@@ -638,17 +635,14 @@ jl_value_t *jl_load(const char *fname)
         } else {
             jl_errorf("could not open file %s", fname);
         }
-    } else if (build_base_mode) {
-        fpath = realpath(fname, NULL);
-        fname = fpath;
     }
     if (jl_start_parsing_file(fname) != 0) {
         jl_errorf("could not open file %s", fname);
     }
-    jl_value_t *result = jl_parse_eval_all(fname, strlen(fname));
-    if (build_base_mode) {
+    if (jl_options.load_log) {
         jl_log_deps(fname);
     }
+    jl_value_t *result = jl_parse_eval_all(fname, strlen(fname));
     free(fpath);
     return result;
 }

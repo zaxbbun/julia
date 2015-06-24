@@ -1516,6 +1516,7 @@ typedef struct {
     const char *outputbc;
     const char *outputo;
     const char *outputji;
+    const char *load_log;
 } jl_options_t;
 
 extern DLLEXPORT jl_options_t jl_options;

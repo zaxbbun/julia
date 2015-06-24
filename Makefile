@@ -39,11 +39,17 @@ endif
 
 BASE_SRCS := $(wildcard base/*.jl base/*/*.jl base/*/*/*.jl)
 
+# on windows, also generate a .ji file so we can delete the .dll
+ifeq ($(OS),WINNT)
+JULIA_SYSIMG_BUILD_FLAGS += --output-ji $(call cygpath_w,$(build_private_libdir)/sys.ji)
+endif
+
 COMMA:=,
 $(build_private_libdir)/sys.o: VERSION $(BASE_SRCS) $(build_docdir)/helpdb.jl
 	@$(call PRINT_JULIA, cd base && \
-	$(call spawn,$(JULIA_EXECUTABLE)) -C $(JULIA_CPU_TARGET) --build $(call cygpath_w,$(build_private_libdir)/sys) -f \
-		-J $(call cygpath_w,$(build_private_libdir)/inference.ji) sysimg.jl \
+	$(call spawn,$(JULIA_EXECUTABLE)) -C $(JULIA_CPU_TARGET) --output-o $(call cygpath_w,$(build_private_libdir)/sys.o) $(JULIA_SYSIMG_BUILD_FLAGS) \
+		--load-log $(call cygpath_w,$(build_private_libdir)/sys.fnames) -f \
+		-J $(call cygpath_w,$(build_private_libdir)/inference.so) sysimg.jl \
 		|| { echo '*** This error is usually fixed by running `make clean`. If the error persists$(COMMA) try `make cleanall`. ***' && false; } )
 
 .PHONY: default debug release release-candidate \

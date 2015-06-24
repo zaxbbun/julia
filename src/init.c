@@ -116,6 +116,7 @@ jl_options_t jl_options = { 0,    // quiet
                             NULL, // outputbc
                             NULL, // outputo
                             NULL, // outputji
+                            NULL // load_log
 };
 
 int jl_boot_file_loaded = 0;
@@ -897,7 +898,7 @@ int isabspath(const char *in)
     return 0; // relative path
 }
 
-static char *abspath(const char *in)
+char *abspath(const char *in)
 { // compute an absolute path location, so that chdir doesn't change the file reference
 #ifndef _OS_WINDOWS_
     char *out = realpath(in, NULL);
@@ -990,6 +991,8 @@ static void jl_resolve_sysimg_location(JL_IMAGE_SEARCH rel)
         jl_options.machinefile = abspath(jl_options.machinefile);
     if (jl_options.load)
         jl_options.load = abspath(jl_options.load);
+    if (jl_options.load_log)
+        jl_options.load_log = abspath(jl_options.load_log);
 }
 
 #ifdef _OS_DARWIN_
