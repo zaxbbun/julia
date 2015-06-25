@@ -562,11 +562,6 @@ static Value *julia_binding_gv(jl_binding_t *b)
 
 // --- mapping between julia and llvm types ---
 
-static bool type_is_ghost(Type *ty)
-{
-    return (ty == T_void || ty->isEmptyTy());
-}
-
 static Type *julia_struct_to_llvm(jl_value_t *jt);
 
 static Type *julia_type_to_llvm(jl_value_t *jt)
@@ -610,10 +605,6 @@ static Type *julia_type_to_llvm(jl_value_t *jt)
     return jl_pvalue_llvmt;
 }
 
-static Type *julia_type_to_llvm(const jl_cgval_t &jt) {
-    return julia_type_to_llvm(jt.typ);
-}
-
 static Type *julia_struct_to_llvm(jl_value_t *jt)
 {
     // this function converts a Julia Type into the equivalent LLVM struct
@@ -647,7 +638,7 @@ static Type *julia_struct_to_llvm(jl_value_t *jt)
                 if (lasttype != NULL && lasttype != lty)
                     isvector = false;
                 lasttype = lty;
-                if (lty == T_void || lty->isEmptyTy())
+                if (type_is_ghost(lty))
                     lty = NoopType;
                 latypes.push_back(lty);
             }
@@ -655,7 +646,7 @@ static Type *julia_struct_to_llvm(jl_value_t *jt)
                 structdecl->setBody(latypes);
             }
             else {
-                if (isvector && lasttype != T_int1 && lasttype != T_void) {
+                if (isvector && lasttype != T_int1 && !type_is_ghost(lasttype)) {
                     // TODO: currently we get LLVM assertion failures for other vector sizes
                     bool validVectorSize = (ntypes == 2 || ntypes == 4 || ntypes == 6);
                     if (0 && lasttype->isSingleValueType() && !lasttype->isVectorTy() && validVectorSize) // currently disabled due to load/store alignment issues
@@ -989,7 +980,7 @@ static jl_cgval_t typed_load(Value *ptr, Value *idx_0based, jl_value_t *jltype,
 {
     Type *elty = julia_type_to_llvm(jltype);
     assert(elty != NULL);
-    if (elty == T_void)
+    if (type_is_ghost(elty))
         return ghostValue(jltype);
     bool isbool=false;
     if (elty == T_int1) {
@@ -1035,7 +1026,7 @@ static void typed_store(Value *ptr, Value *idx_0based, const jl_cgval_t &rhs,
 {
     Type *elty = julia_type_to_llvm(jltype);
     assert(elty != NULL);
-    if (elty == T_void)
+    if (type_is_ghost(elty))
         return;
     if (elty == T_int1) {
         elty = T_int8;
@@ -1151,7 +1142,6 @@ type_of_constant:
 
 // --- accessing the representations of built-in data types ---
 
-static Value *allocate_box_dynamic(Value *jlty, Value *nb, const jl_cgval_t &v);
 static void jl_add_linfo_root(jl_lambda_info_t *li, jl_value_t *val);
 
 static Value *data_pointer(Value *x)
@@ -1237,7 +1227,7 @@ static jl_cgval_t emit_getfield_knownidx(const jl_cgval_t &strct, unsigned idx, 
         raise_exception_unless(ConstantInt::get(T_int1,0), prepare_global(jlundeferr_var), ctx);
         return jl_cgval_t(); // unreachable
     }
-    if (elty == T_void)
+    if (type_is_ghost(elty))
         return ghostValue(jfty);
     Value *fldv = NULL;
     if (strct.isboxed) {
@@ -1497,23 +1487,12 @@ static jl_cgval_t tpropagate(const jl_cgval_t &a, Value *b)
 
 // --- boxing ---
 
-static Value *init_bits_value(Value *newv, Value *jt, Type *t, const jl_cgval_t &vinfo)
+static Value* emit_allocobj(size_t static_size);
+static Value *init_bits_value(Value *newv, Value *jt, Value *v)
 {
-    Value *v = (vinfo.ispointer) ? builder.CreateLoad(vinfo.V) : vinfo.V;
     builder.CreateStore(jt, builder.CreateBitCast(emit_typeptr_addr(newv), jl_ppvalue_llvmt));
-    builder.CreateAlignedStore(v, builder.CreateBitCast(data_pointer(newv), PointerType::get(t,0)), 16); // Julia's gc-alignment is 16-bytes
+    builder.CreateAlignedStore(v, builder.CreateBitCast(data_pointer(newv), PointerType::get(v->getType(),0)), 16); // Julia's gc-alignment is 16-bytes
     return newv;
-}
-
-// allocate a box where the type might not be known at compile time
-static Value *allocate_box_dynamic(Value *jlty, Value *nb, const jl_cgval_t &v)
-{
-    // TODO: verify that jlty is a leaftype
-    // TODO: allocate on the stack if !envescapes
-    // TODO: see if nb is a small Constant and call one of the faster allocobj functions
-    Value *newv = builder.CreateCall(prepare_call(jlallocobj_func), nb);
-    // TODO: make sure this is rooted. I think it is.
-    return init_bits_value(newv, jlty, v.V->getType(), v);
 }
 
 static jl_value_t *static_void_instance(jl_value_t *jt)
@@ -1602,9 +1581,6 @@ static Value *call_with_unsigned(Function *ufunc, Value *v)
 // if it's already a pointer it's left alone.
 static Value *boxed(const jl_cgval_t &vinfo, jl_codectx_t *ctx, jl_value_t *jt)
 {
-    Value *v = vinfo.V; // TODO: XXX
-    Type *t = (v == NULL) ? NULL : v->getType();
-
     if (jt == NULL) {
         jt = vinfo.typ;
     }
@@ -1612,33 +1588,32 @@ static Value *boxed(const jl_cgval_t &vinfo, jl_codectx_t *ctx, jl_value_t *jt)
         // we can get a sharper type from julia_type_of than expr_type in some
         // cases, due to ccall's compile-time evaluations of types. see issue #5752
         jl_value_t *jt2 = vinfo.typ;
-        if (jl_subtype(jt2, jt, 0))
+        if (jt2 && jl_subtype(jt2, jt, 0))
             jt = jt2;
     }
-    if (jt == jl_bottom_type)
+    if (jt == jl_bottom_type || jt == NULL) {
+        // We have an undef value on a (hopefully) dead branch
         return UndefValue::get(jl_pvalue_llvmt);
-    UndefValue *uv = NULL;
-    if (v == NULL || (uv = dyn_cast<UndefValue>(v)) != 0 || t == NoopType) {
-        if (uv != NULL && jl_is_datatype(jt)) {
-            jl_datatype_t *jb = (jl_datatype_t*)jt;
-            // We have an undef value on a hopefully dead branch
-            if (jl_isbits(jb) && jb->size != 0)
-                return UndefValue::get(jl_pvalue_llvmt);
-        }
+    }
+    if (vinfo.isghost) {
         jl_value_t *s = static_void_instance(jt);
         assert(s);
         return literal_pointer_val(s);
     }
-    if (t == jl_pvalue_llvmt)
-        return v;
-    if (t == T_int1) return julia_bool(v);
-    if (t == T_void || t->isEmptyTy()) {
-        jl_value_t *s = static_void_instance(jt);
-        return literal_pointer_val(s);
+    Type *t = julia_type_to_llvm(vinfo.typ);
+    assert(!type_is_ghost(t)); // should have been handled by isghost above!
+
+    if (vinfo.isboxed)
+        return vinfo.V;
+
+    Value *v = vinfo.V;
+    if (vinfo.ispointer) {
+        v = builder.CreateLoad(builder.CreatePointerCast(v, t->getPointerTo()));
     }
+    if (t == T_int1) return julia_bool(v);
     Constant *c = NULL;
     if ((c = dyn_cast<Constant>(v)) != NULL) {
-        jl_value_t *s = static_constant_instance(c,jt);
+        jl_value_t *s = static_constant_instance(c, jt);
         jl_add_linfo_root(ctx->linfo, s);
         return literal_pointer_val(s);
     }
@@ -1651,23 +1626,7 @@ static Value *boxed(const jl_cgval_t &vinfo, jl_codectx_t *ctx, jl_value_t *jt)
     if (jb == jl_int64_type) return call_with_signed(box_int64_func, v);
     if (jb == jl_float32_type) return builder.CreateCall(prepare_call(box_float32_func), v);
     //if (jb == jl_float64_type) return builder.CreateCall(box_float64_func, v);
-    if (jb == jl_float64_type) {
-        // manually inline alloc & init of Float64 box. cheap, I know.
-#ifdef _P64
-        Value *newv = builder.CreateCall(prepare_call(jlalloc1w_func)
-#ifdef LLVM37
-            , {}
-#endif
-        );
-#else
-        Value *newv = builder.CreateCall(prepare_call(jlalloc2w_func)
-#ifdef LLVM37
-            , {}
-#endif
-        );
-#endif
-        return init_bits_value(newv, literal_pointer_val(jt), t, vinfo);
-    }
+    // for Float64, fall through to generic case below, to inline alloc & init of Float64 box. cheap, I know.
     if (jb == jl_uint8_type)  return call_with_unsigned(box_uint8_func, v);
     if (jb == jl_uint16_type) return call_with_unsigned(box_uint16_func, v);
     if (jb == jl_uint32_type) return call_with_unsigned(box_uint32_func, v);
@@ -1692,7 +1651,7 @@ static Value *boxed(const jl_cgval_t &vinfo, jl_codectx_t *ctx, jl_value_t *jt)
         return literal_pointer_val(jb->instance);
     }
 
-    return allocate_box_dynamic(literal_pointer_val(jt), ConstantInt::get(T_size, jl_datatype_size(jt)), vinfo);
+    return init_bits_value(emit_allocobj(jl_datatype_size(jt)), literal_pointer_val(jt), v);
 }
 
 static void emit_cpointercheck(const jl_cgval_t &x, const std::string &msg,
@@ -1826,10 +1785,10 @@ static jl_cgval_t emit_new_struct(jl_value_t *ty, size_t nargs, jl_value_t **arg
         if (jl_isbits(sty)) {
             Type *lt = julia_type_to_llvm(ty);
             size_t na = nargs-1 < nf ? nargs-1 : nf;
-            if (lt == T_void) {
+            if (type_is_ghost(lt)) {
                 for (size_t i=0; i < na; i++)
                     emit_unboxed(args[i+1], ctx);  // do side effects
-                return mark_julia_type(UndefValue::get(NoopType),ty);
+                return ghostValue(ty);
             }
             Value *strct = UndefValue::get(lt);
             unsigned idx = 0;
@@ -1922,10 +1881,11 @@ static jl_cgval_t emit_new_struct(jl_value_t *ty, size_t nargs, jl_value_t **arg
     }
     else if (!sty->mutabl) {
         // 0 fields, ghost
-        return ghostValue(ty);
+        return ghostValue(sty);
     }
     else {
         // 0 fields, singleton
-        return mark_julia_type(literal_pointer_val(jl_new_struct_uninit(sty)), jl_typeof(sty));
+        assert(sty->instance != NULL);
+        return mark_julia_type(literal_pointer_val(sty->instance), sty);
     }
 }

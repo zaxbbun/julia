@@ -395,7 +395,7 @@ struct jl_cgval_t {
     jl_cgval_t(const jl_cgval_t &V, jl_value_t *typ) : // copy constructor with new type
         V(V.V),
         typ(typ),
-        isboxed(V.isboxed),
+        isboxed(V.isboxed && V.typ == typ),
         isghost(V.isghost),
         ispointer(V.ispointer),
         isimmutable(V.isimmutable),
@@ -654,6 +654,12 @@ static void finalize_gc_frame(jl_codectx_t *ctx);
 
 // NoopType
 static Type *NoopType;
+static Value *literal_pointer_val(jl_value_t *p);
+static Type *julia_type_to_llvm(jl_value_t *jt);
+static bool type_is_ghost(Type *ty)
+{
+    return (ty == T_void || ty->isEmptyTy());
+}
 
 // --- convenience functions for tagging llvm values with julia types ---
 
@@ -689,6 +695,16 @@ static inline jl_cgval_t ghostValue(jl_datatype_t *typ)
 {
     return ghostValue((jl_value_t*)typ);
 }
+
+static inline jl_cgval_t mark_julia_const(jl_value_t *jv)
+{
+    jl_value_t *typ = jl_typeof(jv);
+    if (type_is_ghost(julia_type_to_llvm(typ))) {
+        return ghostValue(typ);
+    }
+    return mark_julia_type(literal_pointer_val(jv), typ);
+}
+
 
 static Value *emit_reg2mem(Value *v, jl_codectx_t *ctx) {
     return v;
@@ -800,7 +816,7 @@ static void maybe_alloc_arrayvar(jl_sym_t *s, jl_codectx_t *ctx)
         jl_arrayvar_t av;
         int ndims = jl_unbox_long(jl_tparam1(jt));
         Type *elt = julia_type_to_llvm(jl_tparam0(jt));
-        if (elt == T_void)
+        if (type_is_ghost(elt))
             return;
         // CreateAlloca is OK here because maybe_alloc_arrayvar is only called in the prologue setup
         av.dataptr = builder.CreateAlloca(PointerType::get(elt,0));
@@ -2150,12 +2166,8 @@ static bool emit_known_call(jl_cgval_t *ret, jl_value_t *ff,
 // returns true if the call has been handled
 {
     if (jl_typeis(ff, jl_intrinsic_type)) {
-        if (emit_typed_intrinsic(ret, (intrinsic)*(uint32_t*)jl_data_ptr(ff),
-                              args, nargs, ctx))
-            return true;
-        Value *v = emit_intrinsic((intrinsic)*(uint32_t*)jl_data_ptr(ff),
+        *ret = emit_intrinsic((intrinsic)*(uint32_t*)jl_data_ptr(ff),
                               args, nargs, ctx);
-        *ret = mark_julia_type(v, expr_type(expr,ctx));
         return true;
     }
     if (!jl_is_func(ff)) {
@@ -2354,6 +2366,7 @@ static bool emit_known_call(jl_cgval_t *ret, jl_value_t *ff,
 
     else if (f->fptr == &jl_f_throw && nargs==1) {
         Value *arg1 = boxed(emit_expr(args[1], ctx), ctx);
+        // emit a "conditional" throw so that codegen does't end up trying to emit code after an "unreachable" terminator
         raise_exception_unless(ConstantInt::get(T_int1,0), arg1, ctx);
         *ret = jl_cgval_t();
         JL_GC_POP();
@@ -2677,7 +2690,7 @@ static bool emit_known_call(jl_cgval_t *ret, jl_value_t *ff,
                     // add root for types not cached. issue #7065
                     jl_add_linfo_root(ctx->linfo, ty);
                 }
-                *ret = mark_julia_type(literal_pointer_val(ty), jl_datatype_type);
+                *ret = mark_julia_const(ty);
                 JL_GC_POP();
                 return true;
             }
@@ -2739,7 +2752,7 @@ static jl_cgval_t emit_call_function_object(jl_function_t *f, Value *theF, Value
             Type *at = cft->getParamType(idx);
             jl_value_t *jt = jl_nth_slot_type(f->linfo->specTypes,i);
             Type *et = julia_type_to_llvm(jt);
-            if (et == T_void || et->isEmptyTy()) {
+            if (type_is_ghost(et)) {
                 // Still emit the expression in case it has side effects
                 emit_expr(args[i+1], ctx);
                 continue;
@@ -3030,7 +3043,7 @@ static jl_cgval_t emit_var(jl_sym_t *sym, jl_value_t *ty, jl_codectx_t *ctx, boo
             assert(jl_is_symbol(jl_svecref(ctx->sp, i)));
             if (sym == (jl_sym_t*)jl_svecref(ctx->sp, i)) {
                 jl_value_t *sp = jl_svecref(ctx->sp, i+1);
-                return mark_julia_type(literal_pointer_val(sp), jl_typeof(sp));
+                return mark_julia_const(sp);
             }
         }
         jl_binding_t *jbp=NULL;
@@ -3261,7 +3274,7 @@ static jl_cgval_t emit_expr(jl_value_t *expr, jl_codectx_t *ctx, bool isboxed, b
         if (!jl_is_symbol(jv)) {
             jl_add_linfo_root(ctx->linfo, jv);
         }
-        return mark_julia_type(literal_pointer_val(jv), jl_typeof(jv));
+        return mark_julia_const(jv);
     }
     if (jl_is_gotonode(expr)) {
         if (builder.GetInsertBlock()->getTerminator() == NULL) {
@@ -3323,7 +3336,7 @@ static jl_cgval_t emit_expr(jl_value_t *expr, jl_codectx_t *ctx, bool isboxed, b
         if (needroot) {
             jl_add_linfo_root(ctx->linfo, expr);
         }
-        return mark_julia_type(literal_pointer_val(expr), jl_typeof(expr));
+        return mark_julia_const(expr);
     }
 
     jl_expr_t *ex = (jl_expr_t*)expr;
@@ -3452,7 +3465,7 @@ static jl_cgval_t emit_expr(jl_value_t *expr, jl_codectx_t *ctx, bool isboxed, b
         }
         if (jl_is_tuple_type(extype))
             jl_add_linfo_root(ctx->linfo, extype);
-        return mark_julia_type(literal_pointer_val(extype), jl_typeof(extype));
+        return mark_julia_const(extype);
     }
     else if (head == new_sym) {
         jl_value_t *ty = expr_type(args[0], ctx);
@@ -4010,10 +4023,12 @@ static Function *emit_function(jl_lambda_info_t *lam)
 
     size_t i;
     for(i=0; i < nreq; i++) {
-        jl_sym_t *argname = jl_decl_var(jl_cellref(largs,i));
+        jl_value_t *arg = jl_cellref(largs,i);
+        jl_sym_t *argname = jl_decl_var(arg);
         jl_varinfo_t &varinfo = ctx.vars[argname];
         varinfo.isArgument = true;
-        varinfo.value = mark_julia_type((Value*)NULL, jl_any_type);
+        jl_value_t *ty = lam->specTypes ? jl_nth_slot_type(lam->specTypes, i) : (jl_value_t*)jl_any_type;
+        varinfo.value = mark_julia_type((Value*)NULL, ty);
     }
     if (va) {
         jl_varinfo_t &varinfo = ctx.vars[ctx.vaName];
@@ -4739,17 +4754,17 @@ static Function *emit_function(jl_lambda_info_t *lam)
             if (retty == jl_pvalue_llvmt) {
                 retval = boxed(emit_expr(jl_exprarg(ex,0), &ctx, true),&ctx,expr_type(stmt,&ctx));
             }
-            else if (retty != T_void) {
+            else if (!type_is_ghost(retty)) {
                 retval = emit_unbox(retty,
                                     emit_unboxed(jl_exprarg(ex,0), &ctx), jlrettype);
             }
-            else {
+            else { // undef return type
                 emit_expr(jl_exprarg(ex,0), &ctx, false);
                 retval = NULL;
             }
             if (do_malloc_log && lno != -1)
                 mallocVisitLine(filename, lno);
-            if (retty == T_void)
+            if (type_is_ghost(retty))
                 builder.CreateRetVoid();
             else
                 builder.CreateRet(retval);

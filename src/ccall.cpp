@@ -826,18 +826,17 @@ static jl_cgval_t emit_llvmcall(jl_value_t **args, size_t nargs, jl_codectx_t *c
 
 // --- code generator for ccall itself ---
 
-int try_to_determine_bitstype_nbits(jl_value_t *targ, jl_codectx_t *ctx);
-
 static jl_cgval_t mark_or_box_ccall_result(Value *result, jl_value_t *rt_expr, jl_value_t *rt, bool static_rt, jl_codectx_t *ctx)
 {
-    if (!static_rt && rt != (jl_value_t*)jl_any_type) {
-        // box if type was not statically known
-        int nbits = try_to_determine_bitstype_nbits(rt_expr, ctx);
-        result = allocate_box_dynamic(boxed(emit_expr(rt_expr, ctx), ctx),
-                                    ConstantInt::get(T_size, nbits/8),
-                                    mark_julia_type(result, rt));
+    if (!static_rt) {
+        // box if concrete type was not statically known
+        assert(rt == (jl_value_t*)jl_voidpointer_type);
+        Value *runtime_bt = boxed(emit_expr(rt_expr, ctx), ctx);
+        int nb = sizeof(void*);
+        return mark_julia_type(
+                init_bits_value(emit_allocobj(nb), runtime_bt, result),
+                (jl_value_t*)jl_pointer_type);
     }
-
     return mark_julia_type(result, rt);
 }
 
@@ -1020,6 +1019,7 @@ static jl_cgval_t emit_ccall(jl_value_t **args, size_t nargs, jl_codectx_t *ctx)
                 else if (jl_subtype(jl_tparam0(rtt_), (jl_value_t*)jl_array_type, 0)) {
                     // `Array` used as return type just returns a julia object reference
                     rt = (jl_value_t*)jl_any_type;
+                    static_rt = true;
                 }
             }
             if (rt == NULL) {
@@ -1382,8 +1382,8 @@ static jl_cgval_t emit_ccall(jl_value_t **args, size_t nargs, jl_codectx_t *ctx)
     // type because the ABI required us to pass a pointer (sret),
     // then we do not need to do this.
     if (!sret) {
-        if (lrt == T_void)
-            result = literal_pointer_val((jl_value_t*)jl_nothing);
+        if (type_is_ghost(lrt))
+            return ghostValue(rt);
         else if (lrt->isStructTy()) {
             //fprintf(stderr, "ccall rt: %s -> %s\n", f_name, ((jl_tag_type_t*)rt)->name->name->name);
             assert(jl_is_structtype(rt));
