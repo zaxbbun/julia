@@ -247,7 +247,7 @@ static Value *runtime_sym_lookup(PointerType *funcptype, char *f_lib, char *f_na
 #endif
 
 Value *llvm_type_rewrite(Value *v, Type *from_type, Type *target_type, bool tojulia, bool byref, bool issigned, jl_codectx_t *ctx)
-{
+{ // TODO: XXX this function is broken.
     Type *ptarget_type = PointerType::get(target_type, 0);
 
     if (tojulia) {
@@ -314,110 +314,86 @@ Value *llvm_type_rewrite(Value *v, Type *from_type, Type *target_type, bool toju
 
 // --- argument passing and scratch space utilities ---
 
-static Value *julia_to_native(Type *ty, jl_value_t *jt, const jl_cgval_t &jvinfo,
-                              jl_value_t *aty, bool addressOf,
-                              bool byRef, bool inReg,
-                              bool needCopy, bool tojulia,
-                              int argn, jl_codectx_t *ctx,
+static Value *julia_to_native(Type *to, jl_value_t *jlto, const jl_cgval_t &jvinfo,
+                              bool addressOf, bool byRef, bool inReg, bool needCopy,
+                              bool tojulia, int argn, jl_codectx_t *ctx,
                               bool *needStackRestore)
 {
-    Value *jv = jvinfo.V; // TODO: XXX
-    Type *vt = jv->getType();
-
     // We're passing Any
-    if (ty == jl_pvalue_llvmt) {
+    if (to == jl_pvalue_llvmt) {
         return boxed(jvinfo, ctx);
     }
-
-    if (!tojulia && vt != jl_pvalue_llvmt && julia_type_to_llvm(aty)->isAggregateType()) {
-        // this value is expected to be a pointer in the julia codegen,
-        // so it needs to be extracted first if not tojulia
-        vt = vt->getContainedType(0);
-    }
-
-    if (ty == vt && !addressOf && !byRef) {
-        return jv;
-    }
-
-    if (vt != jl_pvalue_llvmt) {
-        // argument value is unboxed
-        if (vt != jv->getType())
-            jv = builder.CreateLoad(jv); // something stack allocated
-        if (addressOf || (byRef && inReg)) {
-            if (ty->isPointerTy() && ty->getContainedType(0) == vt) {
-                // pass the address of an alloca'd thing, not a box
-                // since those are immutable.
-                Value *slot = emit_static_alloca(vt, ctx);
-                builder.CreateStore(jv, slot);
-                return builder.CreateBitCast(slot, ty);
-            }
-        }
-        else if ((vt->isIntegerTy() && ty->isIntegerTy()) ||
-                 (vt->isFloatingPointTy() && ty->isFloatingPointTy()) ||
-                 (vt->isPointerTy() && ty->isPointerTy())) {
-            if (vt->getPrimitiveSizeInBits() ==
-                ty->getPrimitiveSizeInBits()) {
-                if (!byRef) {
-                    return builder.CreateBitCast(jv, ty);
-                }
-                else {
-                    Value *mem = emit_static_alloca(ty, ctx);
-                    builder.CreateStore(jv,builder.CreateBitCast(mem,vt->getPointerTo()));
-                    return mem;
-                }
-            }
-        }
-        else if (vt->isStructTy()) {
-            if (byRef) {
-                Value *mem = emit_static_alloca(vt, ctx);
-                builder.CreateStore(jv, mem);
-                return mem;
-            }
-            else {
-                return jv;
-            }
-        }
-
-        emit_error("ccall: argument type did not match declaration", ctx);
-    }
-
-    // argument value is boxed (jl_value_t*)
-    if (jl_is_tuple(jt)) {
+    if (jl_is_tuple(jlto)) {
         emit_error("ccall: unimplemented: boxed tuple argument type", ctx);
-        return jv; // TODO: this is wrong
+        return UndefValue::get(to);
     }
-    if (jl_is_cpointer_type(jt) && addressOf) {
-        assert(ty->isPointerTy());
-        jl_value_t *ety = jl_tparam0(jt);
-        if (aty != ety && ety != (jl_value_t*)jl_any_type && jt != (jl_value_t*)jl_voidpointer_type) {
+
+    jl_value_t *ety = jlto;
+    if (addressOf) {
+        if (!jl_is_cpointer_type(jlto)) {
+            emit_error("ccall: & on argument was not matched by Ptr{T} argument type", ctx);
+            return UndefValue::get(to); // the only "safe" thing to emit here is the expected struct
+        }
+        ety = jl_tparam0(jlto);
+        if (jlto == (jl_value_t*)jl_voidpointer_type)
+            ety = jvinfo.typ; // skip the type-check
+    }
+    if (addressOf || byRef)
+        assert(to->isPointerTy());
+    if (jvinfo.typ != ety || ety == (jl_value_t*)jl_any_type) {
+        if (!addressOf && jlto == (jl_value_t*)jl_voidpointer_type) {
+            // allow a bit more flexibility for what can be passed to (void*)
+            if (!jl_is_cpointer_type(jvinfo.typ)) {
+                // emit a typecheck, if not statically known to be correct
+                std::stringstream msg;
+                msg << "ccall argument ";
+                msg << argn;
+                emit_cpointercheck(jvinfo, msg.str(), ctx);
+            }
+        }
+        else {
+            // emit a typecheck, if not statically known to be correct
             std::stringstream msg;
             msg << "ccall argument ";
             msg << argn;
             emit_typecheck(jvinfo, ety, msg.str(), ctx);
         }
-        if (jl_is_mutable_datatype(ety)) {
-            // no copy, just reference the data field
-            return builder.CreateBitCast(jv, ty);
-        }
-        else if (jl_is_immutable_datatype(ety) && jt != (jl_value_t*)jl_voidpointer_type) {
-            // yes copy
-            Value *nbytes;
-            if (jl_is_leaf_type(ety))
-                nbytes = ConstantInt::get(T_int32, jl_datatype_size(ety));
-            else
-                nbytes = tbaa_decorate(tbaa_datatype, builder.CreateLoad(
-                                builder.CreateGEP(builder.CreatePointerCast(emit_typeof(jv), T_pint32),
-                                    ConstantInt::get(T_size, offsetof(jl_datatype_t,size)/sizeof(int32_t))),
-                                false));
-            *needStackRestore = true;
-            AllocaInst *ai = builder.CreateAlloca(T_int8, nbytes);
-            ai->setAlignment(16);
-            builder.CreateMemCpy(ai, builder.CreateBitCast(jv, T_pint8), nbytes, sizeof(void*)); // minimum gc-alignment in julia is pointer size
-            return builder.CreateBitCast(ai, ty);
+    }
+
+    if (!addressOf && !byRef)
+        return emit_unbox(to, jvinfo, jlto);
+
+    if (addressOf && jvinfo.isboxed) {
+        if (!jl_is_abstracttype(ety)) {
+            if (jl_is_mutable_datatype(ety)) {
+                // no copy, just reference the data field
+                return builder.CreateBitCast(jvinfo.V, to);
+            }
+            else if (jl_is_immutable_datatype(ety) && jlto != (jl_value_t*)jl_voidpointer_type) {
+                // yes copy
+                Value *nbytes;
+                AllocaInst *ai;
+                if (jl_is_leaf_type(ety)) {
+                    int nb = jl_datatype_size(ety);
+                    nbytes = ConstantInt::get(T_int32, nb);
+                    ai = emit_static_alloca(T_int8, nb, ctx);
+                }
+                else {
+                    nbytes = tbaa_decorate(tbaa_datatype, builder.CreateLoad(
+                                    builder.CreateGEP(builder.CreatePointerCast(emit_typeof(jvinfo), T_pint32),
+                                        ConstantInt::get(T_size, offsetof(jl_datatype_t,size)/sizeof(int32_t))),
+                                    false));
+                    ai = builder.CreateAlloca(T_int8, nbytes);
+                    *needStackRestore = true;
+                }
+                ai->setAlignment(16);
+                builder.CreateMemCpy(ai, builder.CreateBitCast(jvinfo.V, T_pint8), nbytes, sizeof(void*)); // minimum gc-alignment in julia is pointer size
+                return builder.CreateBitCast(ai, to);
+            }
         }
         // emit maybe copy
         *needStackRestore = true;
-        Value *jvt = emit_typeof(jv);
+        Value *jvt = emit_typeof(jvinfo);
         BasicBlock *mutableBB = BasicBlock::Create(getGlobalContext(),"is-mutable",ctx->f);
         BasicBlock *immutableBB = BasicBlock::Create(getGlobalContext(),"is-immutable",ctx->f);
         BasicBlock *afterBB = BasicBlock::Create(getGlobalContext(),"after",ctx->f);
@@ -429,7 +405,7 @@ static Value *julia_to_native(Type *ty, jl_value_t *jt, const jl_cgval_t &jvinfo
                 T_int1);
         builder.CreateCondBr(ismutable, mutableBB, immutableBB);
         builder.SetInsertPoint(mutableBB);
-        Value *p1 = builder.CreatePointerCast(jv, ty);
+        Value *p1 = builder.CreatePointerCast(jvinfo.V, to);
         builder.CreateBr(afterBB);
         builder.SetInsertPoint(immutableBB);
         Value *nbytes = tbaa_decorate(tbaa_datatype, builder.CreateLoad(
@@ -438,38 +414,24 @@ static Value *julia_to_native(Type *ty, jl_value_t *jt, const jl_cgval_t &jvinfo
                     false));
         AllocaInst *ai = builder.CreateAlloca(T_int8, nbytes);
         ai->setAlignment(16);
-        builder.CreateMemCpy(ai, builder.CreatePointerCast(jv, T_pint8), nbytes, sizeof(void*)); // minimum gc-alignment in julia is pointer size
-        Value *p2 = builder.CreatePointerCast(ai, ty);
+        builder.CreateMemCpy(ai, builder.CreatePointerCast(jvinfo.V, T_pint8), nbytes, sizeof(void*)); // minimum gc-alignment in julia is pointer size
+        Value *p2 = builder.CreatePointerCast(ai, to);
         builder.CreateBr(afterBB);
         builder.SetInsertPoint(afterBB);
-        PHINode *p = builder.CreatePHI(ty, 2);
+        PHINode *p = builder.CreatePHI(to, 2);
         p->addIncoming(p1, mutableBB);
         p->addIncoming(p2, immutableBB);
         return p;
     }
-    if (addressOf)
-        jl_error("ccall: unexpected & on argument"); // the only "safe" thing to emit here is the expected struct
-    assert(jl_is_datatype(jt));
-    if (aty != jt) {
-        std::stringstream msg;
-        msg << "ccall argument ";
-        msg << argn;
-        emit_typecheck(jvinfo, jt, msg.str(), ctx);
-    }
-    Value *pjv = builder.CreatePointerCast(jv, PointerType::get(ty,0));
-    if (byRef) {
-        if (!needCopy) {
-            return pjv;
-        }
-        else {
-            Value *mem = emit_static_alloca(ty, ctx);
-            builder.CreateMemCpy(mem, pjv, (uint64_t)jl_datatype_size(jt), (uint64_t)((jl_datatype_t*)jt)->alignment);
-            return mem;
-        }
-    }
-    else {
-        return pjv; // lazy load by llvm_type_rewrite
-    }
+
+    // pass the address of an alloca'd thing, not a box
+    // since those are immutable.
+    Value *slot = emit_static_alloca(to->getContainedType(0), ctx);
+    if (!jvinfo.isboxed)
+        builder.CreateStore(emit_unbox(to->getContainedType(0), jvinfo, jlto), slot);
+    else
+        builder.CreateMemCpy(slot, builder.CreateBitCast(jvinfo.V, T_pint8), (uint64_t)jl_datatype_size(jlto), (uint64_t)((jl_datatype_t*)jlto)->alignment);
+    return slot;
 }
 
 typedef struct {
@@ -714,7 +676,7 @@ static jl_cgval_t emit_llvmcall(jl_value_t **args, size_t nargs, jl_codectx_t *c
             arg = emit_unboxed(argi, ctx);
         }
 
-        Value *v = julia_to_native(t, tti, arg, expr_type(argi, ctx), false, false, false, false, false, i, ctx, NULL);
+        Value *v = julia_to_native(t, tti, arg, false, false, false, false, false, i, ctx, NULL);
         // make sure args are rooted
         if (t == jl_pvalue_llvmt && (needroot || might_need_root(argi))) {
             make_gcroot(v, ctx);
@@ -1151,13 +1113,13 @@ static jl_cgval_t emit_ccall(jl_value_t **args, size_t nargs, jl_codectx_t *ctx)
         if (addressOf)
             largty = jl_pvalue_llvmt;
         else
-            largty = julia_struct_to_llvm(jl_svecref(tt, 0));
+            largty = julia_struct_to_llvm(tti);
         if (largty == jl_pvalue_llvmt) {
             ary = boxed(emit_expr(argi, ctx),ctx);
         }
         else {
             assert(!addressOf);
-            ary = emit_unbox(largty, emit_unboxed(argi, ctx), jl_svecref(tt, 0));
+            ary = emit_unbox(largty, emit_unboxed(argi, ctx), tti);
         }
         JL_GC_POP();
         return mark_or_box_ccall_result(builder.CreateBitCast(ary, lrt),
@@ -1283,7 +1245,7 @@ static jl_cgval_t emit_ccall(jl_value_t **args, size_t nargs, jl_codectx_t *ctx)
             arg = emit_unboxed(argi, ctx);
         }
 
-        Value *v = julia_to_native(largty, jargty, arg, expr_type(argi, ctx), addressOf, byRefList[ai], inRegList[ai],
+        Value *v = julia_to_native(largty, jargty, arg, addressOf, byRefList[ai], inRegList[ai],
                     need_private_copy(jargty, byRefList[ai]), false, ai + 1, ctx, &needStackRestore);
         // make sure args are rooted
         if (largty == jl_pvalue_llvmt && (needroot || might_need_root(argi))) {

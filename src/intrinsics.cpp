@@ -103,17 +103,18 @@ static Type *JL_INTT(Type *t)
     if (t->isPointerTy())
         return T_size;
     if (t == T_float32) return T_int32;
-    assert(t == T_float64);
-    return T_int64;
+    if (t == T_float64) return T_int64;
+    assert(t == T_void);
+    return T_void;
 }
 static jl_value_t *JL_JLINTT(Type *t)
 {
     assert(!t->isIntegerTy());
     if (t == T_float32) return (jl_value_t*)jl_float32_type;
     if (t == T_float64) return (jl_value_t*)jl_float64_type;
-    assert(t == Type::getHalfTy(jl_LLVMContext));
-    //TODO: return jl_float16_type;
-    return jl_get_global(jl_base_module, jl_symbol("Float16"));
+    if (t == Type::getHalfTy(jl_LLVMContext)) return jl_get_global(jl_base_module, jl_symbol("Float16"));
+    assert(t == T_void);
+    return jl_bottom_type;
 }
 
 // reinterpret-cast to int
@@ -256,7 +257,7 @@ static jl_cgval_t emit_unboxed(jl_value_t *e, jl_codectx_t *ctx)
 {
     Constant *c = julia_const_to_llvm(e);
     if (c)
-        return mark_julia_type(c, jl_typeof(e));
+        return mark_julia_type(c, expr_type(e, ctx));
     return emit_expr(e, ctx, false);
 }
 
@@ -286,6 +287,9 @@ static Value *emit_unbox(Type *to, const jl_cgval_t &x, jl_value_t *jt)
             return builder.CreatePtrToInt(unboxed, to);
         if (!ty->isPointerTy() && to->isPointerTy())
             return builder.CreateIntToPtr(unboxed, to);
+        if (ty->isPointerTy() && to->isPointerTy())
+            // pointer types are going away anyways, and this can come up in ccall argument conversion
+            return builder.CreatePointerCast(unboxed, to);
         if (ty != to) {
             // this can happen when a branch yielding a different type ends
             // up being dead code, and type inference knows that the other
@@ -305,7 +309,7 @@ static Value *emit_unbox(Type *to, const jl_cgval_t &x, jl_value_t *jt)
     return builder.CreateAlignedLoad(builder.CreateBitCast(p, to->getPointerTo()), 16); // julia's gc gives 16-byte aligned addresses
 }
 
-// unbox, trying to determine type automatically
+// unbox, trying to determine correct bitstype automatically
 // returns some sort of raw, unboxed numeric type (in registers)
 static Value *auto_unbox(const jl_cgval_t &v, jl_codectx_t *ctx)
 {
@@ -410,7 +414,6 @@ static jl_cgval_t generic_box(jl_value_t *targ, jl_value_t *x, jl_codectx_t *ctx
         if (v.isimmutable) { // wrong type, but can lazy load this later as needed
             v.typ = bt;
             v.isboxed = false;
-            v.ispointer = true;
             return v;
         }
         vx = builder.CreateLoad(builder.CreateBitCast(v.V, llvmt->getPointerTo()));
@@ -450,9 +453,10 @@ static jl_cgval_t generic_box(jl_value_t *targ, jl_value_t *x, jl_codectx_t *ctx
 static jl_cgval_t generic_trunc(jl_value_t *targ, jl_value_t *x, jl_codectx_t *ctx, bool check, bool signd)
 {
     jl_value_t *jlto = staticeval_bitstype(targ, "trunc_int", ctx);
-    if (!jlto) return jl_cgval_t();
+    if (!jlto) return jl_cgval_t(); // jlto threw an error
     Type *to = staticeval_bitstype(jlto);
     Value *ix = JL_INT(auto_unbox(x, ctx));
+    if (ix->getType() == T_void) return jl_cgval_t(); // auto_unbox threw an error
     Value *ans = builder.CreateTrunc(ix, to);
     if (check) {
         Value *back = signd ? builder.CreateSExt(ans, ix->getType()) :
@@ -466,24 +470,27 @@ static jl_cgval_t generic_trunc(jl_value_t *targ, jl_value_t *x, jl_codectx_t *c
 static jl_cgval_t generic_sext(jl_value_t *targ, jl_value_t *x, jl_codectx_t *ctx)
 {
     jl_value_t *jlto = staticeval_bitstype(targ, "sext_int", ctx);
-    if (!jlto) return jl_cgval_t();
+    if (!jlto) return jl_cgval_t(); // jlto threw an error
     Type *to = staticeval_bitstype(jlto);
-    Value *ans = builder.CreateSExt(JL_INT(auto_unbox(x,ctx)), to);
+    Value *ix = JL_INT(auto_unbox(x, ctx));
+    if (ix->getType() == T_void) return jl_cgval_t(); // auto_unbox threw an error
+    Value *ans = builder.CreateSExt(ix, to);
     return mark_julia_type(ans, jlto);
 }
 
 static jl_cgval_t generic_zext(jl_value_t *targ, jl_value_t *x, jl_codectx_t *ctx)
 {
     jl_value_t *jlto = staticeval_bitstype(targ, "zext_int", ctx);
-    if (!jlto) return jl_cgval_t();
+    if (!jlto) return jl_cgval_t(); // jlto threw an error
     Type *to = staticeval_bitstype(jlto);
-    Value *ans = builder.CreateZExt(JL_INT(auto_unbox(x,ctx)), to);
+    Value *ix = JL_INT(auto_unbox(x, ctx));
+    if (ix->getType() == T_void) return jl_cgval_t(); // auto_unbox threw an error
+    Value *ans = builder.CreateZExt(ix, to);
     return mark_julia_type(ans, jlto);
 }
 
 static Value *emit_eqfsi(Value *x, Value *y)
 {
-    x = FP(x);
     Value *fy = JL_INT(y);
 
     // using all 64-bit is slightly faster than using mixed sizes
@@ -501,7 +508,6 @@ static Value *emit_eqfsi(Value *x, Value *y)
 
 static Value *emit_eqfui(Value *x, Value *y)
 {
-    x = FP(x);
     Value *fy = JL_INT(y);
 
     // using all 64-bit is slightly faster than using mixed sizes
@@ -517,40 +523,42 @@ static Value *emit_eqfui(Value *x, Value *y)
          builder.CreateICmpEQ(vv, builder.CreateFPToUI(back, vv->getType())));
 }
 
-static jl_cgval_t emit_checked_fptosi(jl_value_t *targ, Value *x, jl_codectx_t *ctx)
+static jl_cgval_t emit_checked_fptosi(jl_value_t *targ, jl_value_t *x, jl_codectx_t *ctx)
 {
     jl_value_t *jlto = staticeval_bitstype(targ, "checked_fptosi", ctx);
     if (!jlto) return jl_cgval_t();
     Type *to = staticeval_bitstype(jlto);
-    x = FP(x);
-    Value *ans = builder.CreateFPToSI(x, to);
-    if (x->getType() == T_float32 && to == T_int32) {
+    Value *fx = FP(auto_unbox(x, ctx));
+    if (fx->getType() == T_void) return jl_cgval_t(); // auto_unbox threw an error
+    Value *ans = builder.CreateFPToSI(fx, to);
+    if (fx->getType() == T_float32 && to == T_int32) {
         raise_exception_unless
-            (builder.CreateFCmpOEQ(builder.CreateFPExt(x, T_float64),
+            (builder.CreateFCmpOEQ(builder.CreateFPExt(fx, T_float64),
                                    builder.CreateSIToFP(ans, T_float64)),
              prepare_global(jlinexacterr_var), ctx);
     }
     else {
-        raise_exception_unless(emit_eqfsi(x, ans), prepare_global(jlinexacterr_var), ctx);
+        raise_exception_unless(emit_eqfsi(fx, ans), prepare_global(jlinexacterr_var), ctx);
     }
     return mark_julia_type(ans, jlto);
 }
 
-static jl_cgval_t emit_checked_fptoui(jl_value_t *targ, Value *x, jl_codectx_t *ctx)
+static jl_cgval_t emit_checked_fptoui(jl_value_t *targ, jl_value_t *x, jl_codectx_t *ctx)
 {
     jl_value_t *jlto = staticeval_bitstype(targ, "checked_fptoui", ctx);
     if (!jlto) return jl_cgval_t();
     Type *to = staticeval_bitstype(jlto);
-    x = FP(x);
-    Value *ans = builder.CreateFPToUI(x, to);
-    if (x->getType() == T_float32 && to == T_int32) {
+    Value *fx = FP(auto_unbox(x, ctx));
+    if (fx->getType() == T_void) return jl_cgval_t(); // auto_unbox threw an error
+    Value *ans = builder.CreateFPToUI(fx, to);
+    if (fx->getType() == T_float32 && to == T_int32) {
         raise_exception_unless
-            (builder.CreateFCmpOEQ(builder.CreateFPExt(x, T_float64),
+            (builder.CreateFCmpOEQ(builder.CreateFPExt(fx, T_float64),
                                    builder.CreateUIToFP(ans, T_float64)),
              prepare_global(jlinexacterr_var), ctx);
     }
     else {
-        raise_exception_unless(emit_eqfui(x, ans), prepare_global(jlinexacterr_var), ctx);
+        raise_exception_unless(emit_eqfui(fx, ans), prepare_global(jlinexacterr_var), ctx);
     }
     return mark_julia_type(ans, jlto);
 }
@@ -784,6 +792,7 @@ static jl_cgval_t emit_intrinsic(intrinsic f, jl_value_t **args, size_t nargs,
     case ccall: return emit_ccall(args, nargs, ctx);
     case cglobal: return emit_cglobal(args, nargs, ctx);
     case llvmcall: return emit_llvmcall(args, nargs, ctx);
+
     HANDLE(pointerref,2)
         return emit_pointerref(args[1], args[2], ctx);
     HANDLE(pointerset,3)
@@ -802,38 +811,33 @@ static jl_cgval_t emit_intrinsic(intrinsic f, jl_value_t **args, size_t nargs,
         return generic_sext(args[1], args[2], ctx);
     HANDLE(zext_int,2)
         return generic_zext(args[1], args[2], ctx);
-
-    HANDLE(checked_fptosi,2) {
-        Value *x = FP(auto_unbox(args[2], ctx));
-        return emit_checked_fptosi(args[1], x, ctx);
-    }
-
-    HANDLE(checked_fptoui,2) {
-        Value *x = FP(auto_unbox(args[2], ctx));
-        return emit_checked_fptoui(args[1], x, ctx);
-    }
+    HANDLE(checked_fptosi,2)
+        return emit_checked_fptosi(args[1], args[2], ctx);
+    HANDLE(checked_fptoui,2)
+        return emit_checked_fptoui(args[1], args[2], ctx);
 
     HANDLE(uitofp,2) {
         jl_value_t *bt = staticeval_bitstype(args[1], "uitofp", ctx);
         if (!bt) return jl_cgval_t();
         int nb = get_bitstype_nbits(bt);
-        return mark_julia_type(
-                builder.CreateUIToFP(JL_INT(auto_unbox(args[2],ctx)), FTnbits(nb)),
-                bt);
+        Value *xi = JL_INT(auto_unbox(args[2],ctx));
+        if (xi->getType() == T_void) return jl_cgval_t(); // auto_unbox threw an error
+        return mark_julia_type(builder.CreateUIToFP(xi, FTnbits(nb)), bt);
     }
 
     HANDLE(sitofp,2) {
         jl_value_t *bt = staticeval_bitstype(args[1], "sitofp", ctx);
         if (!bt) return jl_cgval_t();
         int nb = get_bitstype_nbits(bt);
-        return mark_julia_type(
-                builder.CreateSIToFP(JL_INT(auto_unbox(args[2],ctx)), FTnbits(nb)),
-                bt);
+        Value *xi = JL_INT(auto_unbox(args[2],ctx));
+        if (xi->getType() == T_void) return jl_cgval_t(); // auto_unbox threw an error
+        return mark_julia_type(builder.CreateSIToFP(xi, FTnbits(nb)), bt);
     }
 
     case fptoui:
         if (nargs == 1) {
             Value *x = FP(auto_unbox(args[1], ctx));
+            if (x->getType() == T_void) return jl_cgval_t(); // auto_unbox threw an error
             return mark_julia_type(
                     builder.CreateFPToUI(FP(x), JL_INTT(x->getType())),
                     JL_JLINTT(x->getType()));
@@ -842,10 +846,9 @@ static jl_cgval_t emit_intrinsic(intrinsic f, jl_value_t **args, size_t nargs,
             jl_value_t *bt = staticeval_bitstype(args[1], "sitofp", ctx);
             if (!bt) return jl_cgval_t();
             int nb = get_bitstype_nbits(bt);
-            return mark_julia_type(
-                    builder.CreateFPToUI(FP(auto_unbox(args[2],ctx)),
-                                         Type::getIntNTy(jl_LLVMContext, nb)),
-                    bt);
+            Value *xf = FP(auto_unbox(args[2],ctx));
+            if (xf->getType() == T_void) return jl_cgval_t(); // auto_unbox threw an error
+            return mark_julia_type(builder.CreateFPToUI(xf, Type::getIntNTy(jl_LLVMContext, nb)), bt);
         }
         else {
             jl_error("fptoui: wrong number of arguments");
@@ -862,10 +865,9 @@ static jl_cgval_t emit_intrinsic(intrinsic f, jl_value_t **args, size_t nargs,
             jl_value_t *bt = staticeval_bitstype(args[1], "sitofp", ctx);
             if (!bt) return jl_cgval_t();
             int nb = get_bitstype_nbits(bt);
-            return mark_julia_type(
-                    builder.CreateFPToSI(FP(auto_unbox(args[2],ctx)),
-                                         Type::getIntNTy(jl_LLVMContext, nb)),
-                    bt);
+            Value *xf = FP(auto_unbox(args[2],ctx));
+            if (xf->getType() == T_void) return jl_cgval_t(); // auto_unbox threw an error
+            return mark_julia_type(builder.CreateFPToSI(xf, Type::getIntNTy(jl_LLVMContext, nb)), bt);
         }
         else {
             jl_error("fptosi: wrong number of arguments");
@@ -875,9 +877,9 @@ static jl_cgval_t emit_intrinsic(intrinsic f, jl_value_t **args, size_t nargs,
         jl_value_t *bt = staticeval_bitstype(args[1], "sitofp", ctx);
         if (!bt) return jl_cgval_t();
         int nb = get_bitstype_nbits(bt);
-        return mark_julia_type(
-                builder.CreateFPTrunc(FP(auto_unbox(args[2],ctx)), FTnbits(nb)),
-                bt);
+        Value *xf = FP(auto_unbox(args[2],ctx));
+        if (xf->getType() == T_void) return jl_cgval_t(); // auto_unbox threw an error
+        return mark_julia_type(builder.CreateFPTrunc(xf, FTnbits(nb)), bt);
     }
 
     HANDLE(fpext,2) {
@@ -885,6 +887,7 @@ static jl_cgval_t emit_intrinsic(intrinsic f, jl_value_t **args, size_t nargs,
         if (!bt) return jl_cgval_t();
         int nb = get_bitstype_nbits(bt);
         Value *x = auto_unbox(args[2],ctx);
+        if (x->getType() == T_void) return jl_cgval_t(); // auto_unbox threw an error
 #if JL_NEED_FLOATTEMP_VAR
         // Target platform might carry extra precision.
         // Force rounding to single precision first. The reason is that it's
@@ -908,20 +911,16 @@ static jl_cgval_t emit_intrinsic(intrinsic f, jl_value_t **args, size_t nargs,
         int argStart = ctx->gc.argDepth;
         Value *ifelse_result;
         if (llt1 != jl_pvalue_llvmt && t1 == t2) {
-            Value *x = auto_unbox(args[3], ctx);
-            ifelse_result = builder.CreateSelect(
-                        isfalse,
-                        x,
-                        auto_unbox(args[2], ctx));
+            Value *x = auto_unbox(args[2], ctx);
+            Value *y = auto_unbox(args[3], ctx);
+            ifelse_result = builder.CreateSelect(isfalse, y, x);
         }
         else {
-            Value *arg1 = boxed(emit_expr(args[3],ctx,false), ctx, expr_type(args[3],ctx));
+            Value *arg1 = boxed(emit_expr(args[2],ctx,false), ctx, expr_type(args[2],ctx));
             //TODO: if (arg1->getType() != jl_pvalue_llvmt)
                 make_gcroot(arg1, ctx);
-            ifelse_result = builder.CreateSelect(
-                        isfalse,
-                        arg1,
-                        boxed(emit_expr(args[2],ctx,false), ctx, expr_type(args[2],ctx)));
+            Value *arg2 = boxed(emit_expr(args[3],ctx,false), ctx, expr_type(args[3],ctx));
+            ifelse_result = builder.CreateSelect(isfalse, arg2, arg1);
         }
         ctx->gc.argDepth = argStart;
         jl_value_t *jt = (t1 == t2 ? t1 : (jl_value_t*)jl_any_type);

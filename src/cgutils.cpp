@@ -914,7 +914,7 @@ static void emit_typecheck(const jl_cgval_t &x, jl_value_t *type, const std::str
 }
 
 #define CHECK_BOUNDS 1
-static Value *emit_bounds_check(Value *a, jl_value_t *ty, Value *i, Value *len, jl_codectx_t *ctx)
+static Value *emit_bounds_check(const jl_cgval_t &ainfo, jl_value_t *ty, Value *i, Value *len, jl_codectx_t *ctx)
 {
     Value *im1 = builder.CreateSub(i, ConstantInt::get(T_size, 1));
 #if CHECK_BOUNDS==1
@@ -926,15 +926,26 @@ static Value *emit_bounds_check(Value *a, jl_value_t *ty, Value *i, Value *len, 
         BasicBlock *passBB = BasicBlock::Create(getGlobalContext(),"pass");
         builder.CreateCondBr(ok, passBB, failBB);
         builder.SetInsertPoint(failBB);
-        if (ty == (jl_value_t*)jl_any_type) {
+        if (!ty) { // jl_value_t** tuple (e.g. the vararg)
 #ifdef LLVM37
-            builder.CreateCall(prepare_call(jlvboundserror_func), { a, len, i });
+            builder.CreateCall(prepare_call(jlvboundserror_func), { ainfo.V, len, i });
 #else
-            builder.CreateCall3(prepare_call(jlvboundserror_func), a, len, i);
+            builder.CreateCall3(prepare_call(jlvboundserror_func), ainfo.V, len, i);
 #endif
         }
-        else if (ty && a->getType() != jl_pvalue_llvmt) {
-            if (!a->getType()->isPtrOrPtrVectorTy()) {
+        else if (ainfo.isboxed) { // jl_datatype_t or boxed jl_value_t
+#ifdef LLVM37
+            builder.CreateCall(prepare_call(jlboundserror_func), { ainfo.V, i });
+#else
+            builder.CreateCall2(prepare_call(jlboundserror_func), ainfo.V, i);
+#endif
+        }
+        else { // unboxed jl_value_t*
+            Value *a = ainfo.V;
+            if (ainfo.isghost) {
+                a = Constant::getNullValue(T_pint8);
+            }
+            else if (!ainfo.ispointer) {
                 // CreateAlloca is OK here since we are on an error branch
                 Value *tempSpace = builder.CreateAlloca(a->getType());
                 builder.CreateStore(a, tempSpace);
@@ -952,23 +963,12 @@ static Value *emit_bounds_check(Value *a, jl_value_t *ty, Value *i, Value *len, 
                                 i);
 #endif
         }
-        else {
-#ifdef LLVM37
-            builder.CreateCall(prepare_call(jlboundserror_func), { a, i });
-#else
-            builder.CreateCall2(prepare_call(jlboundserror_func), a, i);
-#endif
-        }
         builder.CreateUnreachable();
         ctx->f->getBasicBlockList().push_back(passBB);
         builder.SetInsertPoint(passBB);
     }
 #endif
     return im1;
-}
-static Value *emit_bounds_check(const jl_cgval_t &a, jl_value_t *ty, Value *i, Value *len, jl_codectx_t *ctx) {
-    assert(a.isboxed);
-    return emit_bounds_check(a.V, ty, i, len, ctx);
 }
 
 // --- loading and storing ---
@@ -1187,10 +1187,8 @@ static bool emit_getfield_unknownidx(jl_cgval_t *ret, const jl_cgval_t &strct, V
         assert(jl_isbits(stt));
         assert(!jl_field_isptr(stt, 0));
         if (nfields == 0) {
-            // TODO: pass correct thing to emit_bounds_check ?
-            idx = emit_bounds_check(tbaa_decorate(tbaa_const, builder.CreateLoad(prepare_global(jlemptysvec_var))),
+            idx = emit_bounds_check(ghostValue(stt),
                                     (jl_value_t*)stt, idx, ConstantInt::get(T_size, nfields), ctx);
-            builder.CreateUnreachable();
             *ret = jl_cgval_t();
             return true;
         }
@@ -1199,7 +1197,6 @@ static bool emit_getfield_unknownidx(jl_cgval_t *ret, const jl_cgval_t &strct, V
             // add root for types not cached
             jl_add_linfo_root(ctx->linfo, (jl_value_t*)stt);
         }
-        // TODO: pass correct thing to emit_bounds_check ?
         Value *idx0 = emit_bounds_check(strct, (jl_value_t*)stt, idx, ConstantInt::get(T_size, nfields), ctx);
         if (strct.isghost) {
             *ret = ghostValue(jt);
@@ -1476,13 +1473,6 @@ static Value *emit_array_nd_index(const jl_cgval_t &ainfo, jl_value_t *ex, size_
 #endif
 
     return i;
-}
-
-// --- propagate julia type from value a to b. returns b. ---
-
-static jl_cgval_t tpropagate(const jl_cgval_t &a, Value *b)
-{
-    return mark_julia_type(b, a.typ);
 }
 
 // --- boxing ---
